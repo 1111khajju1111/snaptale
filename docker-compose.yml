@@ -1,0 +1,43 @@
+﻿version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: snaptale_postgres
+    environment:
+      POSTGRES_USER: snaptale_user
+      POSTGRES_PASSWORD: snaptale_password
+      POSTGRES_DB: snaptale_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: snaptale_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: snaptale_backend
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://snaptale_user:snaptale_password@postgres:5432/snaptale_db
+      - REDIS_URL=redis://redis:6379/0
+      - APP_ENV=development
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:8080,*
+      - AI_PROVIDER=mock
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  postgres_data:
+  redis_data:

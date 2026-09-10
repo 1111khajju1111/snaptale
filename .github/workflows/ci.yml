@@ -1,0 +1,55 @@
+name: SnapTale CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  backend-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: |
+          cd backend
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Backend Tests
+        run: |
+          cd backend
+          pytest -v tests/
+
+  web-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install and Lint Web
+        run: |
+          cd web
+          npm ci || npm install
+          npm run build --if-present
+
+  flutter-analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.x'
+          channel: 'stable'
+      - name: Flutter Analyze & Test
+        run: |
+          cd mobile/flutter_app
+          flutter pub get
+          flutter analyze --no-fatal-infos
+          flutter test
