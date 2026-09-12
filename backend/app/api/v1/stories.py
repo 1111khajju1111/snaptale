@@ -237,8 +237,12 @@ async def get_lore_tree(
     user_id: Optional[str] = Depends(get_optional_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    # Fetch root story
-    res = await db.execute(select(Story).where(Story.id == id))
+    # Fetch root story (eager-load .character since it's read below via
+    # current_story.character.name — accessing it lazily outside this
+    # request's async session would raise MissingGreenlet)
+    res = await db.execute(
+        select(Story).options(selectinload(Story.character)).where(Story.id == id)
+    )
     current_story = res.scalars().first()
     if not current_story:
         raise HTTPException(status_code=404, detail="Story not found.")

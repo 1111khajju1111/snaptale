@@ -1,6 +1,7 @@
 ﻿from typing import Optional, Dict, Any, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from fastapi import HTTPException, status
 from app.models.models import Story, StoryBranch, Character
 from app.schemas.story import StoryDiceRoll, StoryCreate
@@ -164,5 +165,15 @@ async def mutate_story_branch(
     )
     db.add(branch)
     await db.commit()
+
+    # Re-fetch with the relationships that the API layer (and StoryResponse
+    # schema construction) accesses, so the returned instance never triggers
+    # an async lazy-load outside this active DB session (MissingGreenlet).
+    result = await db.execute(
+        select(Story)
+        .options(selectinload(Story.character))
+        .where(Story.id == child_story.id)
+    )
+    child_story = result.scalars().first()
 
     return child_story

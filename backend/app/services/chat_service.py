@@ -2,6 +2,7 @@ from typing import List, Dict, Optional
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from fastapi import HTTPException, status
 from app.models.models import Chat, ChatMessage, Character, Universe, CharacterRelationship, Story
 from app.schemas.character import CharacterDNA
@@ -37,7 +38,18 @@ async def create_chat_thread(
     db.add(chat)
     char.chat_count += 1
     await db.commit()
-    await db.refresh(chat)
+
+    # Re-fetch with .character and .messages eager-loaded. ChatResponse
+    # (from_attributes=True) reads both — chat.character is accessed
+    # explicitly in the router, and pydantic validation reads chat.messages
+    # for the `messages` field. Either access outside this eager-load would
+    # lazy-load past the request's async session and raise MissingGreenlet.
+    result = await db.execute(
+        select(Chat)
+        .options(selectinload(Chat.character), selectinload(Chat.messages))
+        .where(Chat.id == chat.id)
+    )
+    chat = result.scalars().first()
     return chat
 
 async def post_chat_message(

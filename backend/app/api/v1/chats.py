@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from typing import List, Optional
 from app.core.database import get_db
 from app.core.security import get_current_user_id, verify_snapplus_session_token
-from app.models.models import Chat, ChatMessage, Character
+from app.models.models import Chat
 from app.schemas.chat import (
     ChatCreate, ChatResponse, ChatMessageCreate, ChatMessageResponse
 )
@@ -40,10 +41,14 @@ async def list_character_chats(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    res = await db.execute(select(Chat).where(
-        Chat.character_id == id,
-        Chat.user_id == user_id
-    ).order_by(Chat.last_message_at.desc()))
+    res = await db.execute(
+        select(Chat)
+        .options(selectinload(Chat.character), selectinload(Chat.messages))
+        .where(
+            Chat.character_id == id,
+            Chat.user_id == user_id
+        ).order_by(Chat.last_message_at.desc())
+    )
     chats = res.scalars().all()
     output = []
     for c in chats:
@@ -60,7 +65,11 @@ async def get_chat(
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db)
 ):
-    res = await db.execute(select(Chat).where(Chat.id == id, Chat.user_id == user_id))
+    res = await db.execute(
+        select(Chat)
+        .options(selectinload(Chat.character), selectinload(Chat.messages))
+        .where(Chat.id == id, Chat.user_id == user_id)
+    )
     chat = res.scalars().first()
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found.")
@@ -71,15 +80,13 @@ async def get_chat(
                 status_code=403,
                 detail="SnapTale+ private chat is locked. Please verify 4-digit PIN first."
             )
-    
-    msg_res = await db.execute(
-        select(ChatMessage).where(ChatMessage.chat_id == id).order_by(ChatMessage.created_at.asc())
-    )
-    messages = msg_res.scalars().all()
+
+    # chat.messages is already eager-loaded above (and ordered by
+    # created_at via the relationship's order_by), so no separate query
+    # or lazy access is needed here.
     resp = ChatResponse.model_validate(chat)
     if chat.character:
         resp.character_name = chat.character.name
-    resp.messages = [ChatMessageResponse.model_validate(m) for m in messages]
     return resp
 
 @router.post("/chats/{id}/messages", response_model=ChatMessageResponse)
