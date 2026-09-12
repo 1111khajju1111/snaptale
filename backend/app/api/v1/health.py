@@ -1,6 +1,9 @@
-﻿from fastapi import APIRouter
+from datetime import datetime, timezone
+
+from fastapi import APIRouter
 
 router = APIRouter(tags=["monitoring"])
+
 
 @router.get("/health")
 async def health_check():
@@ -11,5 +14,5 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "snaptale-backend",
-        "timestamp": "2026-09-10T00:00:00Z"
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
