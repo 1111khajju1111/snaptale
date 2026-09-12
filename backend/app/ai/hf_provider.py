@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import mimetypes
 import os
 from io import BytesIO
 from typing import List, Dict, Optional, Any
@@ -31,9 +32,17 @@ TEXT_MODEL_NAME = os.getenv(
     "openai/gpt-oss-20b",
 )
 
+# Gemma 3 12B is the recommended SnapTale VLM.
+#
+# It is used for:
+#   - human detection
+#   - non-human image analysis
+#   - generated-image moderation
+#
+# Provider is configured independently below.
 VISION_MODEL_NAME = os.getenv(
     "HF_VISION_MODEL",
-    "Qwen/Qwen2.5-VL-3B-Instruct",
+    "google/gemma-3-12b-it",
 )
 
 IMAGE_MODEL_NAME = os.getenv(
@@ -42,20 +51,29 @@ IMAGE_MODEL_NAME = os.getenv(
 )
 
 
-# Providers are configured independently by capability.
+# ============================================================================
+# PROVIDERS
+# ============================================================================
+#
+# Providers are intentionally capability-specific.
 #
 # Vision:
-#   Featherless AI is selected because the Qwen VLM is available there.
+#   DeepInfra for Gemma 3 vision.
 #
 # Text:
-#   auto allows Hugging Face to select a compatible provider.
+#   auto lets Hugging Face select an available compatible provider.
 #
 # Image:
-#   auto allows Hugging Face to select a compatible provider.
+#   auto lets Hugging Face select an available image provider.
+#
+# IMPORTANT:
+# Do not use one global HF_PROVIDER here.
+# Different models may have completely different provider availability.
+# ============================================================================
 
 VISION_PROVIDER = os.getenv(
     "HF_VISION_PROVIDER",
-    "featherless-ai",
+    "deepinfra",
 )
 
 TEXT_PROVIDER = os.getenv(
@@ -108,7 +126,7 @@ def _init_client(
 
     Provider is capability-specific:
 
-        Vision -> featherless-ai
+        Vision -> deepinfra
         Text   -> auto
         Image  -> auto
     """
@@ -128,15 +146,13 @@ def _init_client(
         )
 
         logger.info(
-            "Initialized Hugging Face client "
-            "with provider=%s",
+            "Initialized Hugging Face client provider=%s",
             provider,
         )
 
         return client
 
     except Exception as exc:
-
         logger.error(
             "Failed to initialize Hugging Face client: %s",
             exc,
@@ -159,8 +175,8 @@ def _parse_json_response(
     Supports:
 
     1. Plain JSON
-    2. ```json fenced blocks
-    3. JSON embedded inside small amounts of prose
+    2. Markdown fenced JSON
+    3. JSON surrounded by small amounts of prose
     """
 
     if not text:
@@ -171,18 +187,20 @@ def _parse_json_response(
     cleaned = text.strip()
 
     # ------------------------------------------------------------------------
-    # Remove Markdown code fences
+    # Remove markdown code fences
     # ------------------------------------------------------------------------
 
     if cleaned.startswith("```"):
-
         lines = cleaned.splitlines()
 
-        if lines and lines[0].strip().lower() in (
-            "```json",
-            "```",
-        ):
-            lines = lines[1:]
+        if lines:
+            first = lines[0].strip().lower()
+
+            if first in (
+                "```json",
+                "```",
+            ):
+                lines = lines[1:]
 
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
@@ -190,7 +208,7 @@ def _parse_json_response(
         cleaned = "\n".join(lines).strip()
 
     # ------------------------------------------------------------------------
-    # First attempt: direct JSON
+    # Direct JSON
     # ------------------------------------------------------------------------
 
     try:
@@ -203,20 +221,16 @@ def _parse_json_response(
         pass
 
     # ------------------------------------------------------------------------
-    # Second attempt: locate outer JSON object
+    # Extract JSON object from surrounding text
     # ------------------------------------------------------------------------
 
     start = cleaned.find("{")
     end = cleaned.rfind("}")
 
     if start >= 0 and end > start:
-
-        candidate = cleaned[
-            start : end + 1
-        ]
+        candidate = cleaned[start:end + 1]
 
         try:
-
             parsed = json.loads(candidate)
 
             if isinstance(parsed, dict):
@@ -236,22 +250,12 @@ def _parse_json_response(
 
 def _message_text(result) -> str:
     """
-    Extract generated text from Hugging Face
-    OpenAI-compatible ChatCompletion responses.
+    Extract generated text from Hugging Face OpenAI-compatible
+    ChatCompletion responses.
 
-    Supports:
-
-    - normal message.content
-    - list-based content
-    - structured content blocks
-    - reasoning_content
-    - reasoning
-    - output_text
-    - choice.text
-
-    This is intentionally defensive because different
-    Hugging Face inference providers can expose slightly
-    different response structures.
+    Different inference providers can expose slightly different
+    response structures, so this function intentionally performs
+    defensive extraction.
     """
 
     if not result:
@@ -279,7 +283,7 @@ def _message_text(result) -> str:
     )
 
     # ------------------------------------------------------------------------
-    # Standard OpenAI-compatible response
+    # Standard message.content
     # ------------------------------------------------------------------------
 
     if message is not None:
@@ -290,13 +294,15 @@ def _message_text(result) -> str:
             None,
         )
 
-        # Normal string content
         if isinstance(content, str):
 
             if content.strip():
                 return content.strip()
 
-        # Structured/list content
+        # --------------------------------------------------------------------
+        # Structured content blocks
+        # --------------------------------------------------------------------
+
         if isinstance(content, list):
 
             parts = []
@@ -305,14 +311,10 @@ def _message_text(result) -> str:
 
                 if isinstance(item, dict):
 
-                    text = item.get(
-                        "text"
-                    )
+                    text = item.get("text")
 
                     if text:
-                        parts.append(
-                            str(text)
-                        )
+                        parts.append(str(text))
 
                 else:
 
@@ -323,9 +325,7 @@ def _message_text(result) -> str:
                     )
 
                     if text:
-                        parts.append(
-                            str(text)
-                        )
+                        parts.append(str(text))
 
             combined = "".join(parts).strip()
 
@@ -333,13 +333,16 @@ def _message_text(result) -> str:
                 return combined
 
         # --------------------------------------------------------------------
-        # Reasoning-capable models/providers
+        # Reasoning-capable providers
+        #
+        # Some providers/models may place generated content in one of these
+        # fields rather than message.content.
         # --------------------------------------------------------------------
 
         for attribute in (
+            "output_text",
             "reasoning_content",
             "reasoning",
-            "output_text",
             "text",
         ):
 
@@ -355,7 +358,7 @@ def _message_text(result) -> str:
                     return value.strip()
 
     # ------------------------------------------------------------------------
-    # Some providers may put generated text directly on choice
+    # Some providers expose text directly on choice
     # ------------------------------------------------------------------------
 
     for attribute in (
@@ -375,25 +378,25 @@ def _message_text(result) -> str:
                 return value.strip()
 
     # ------------------------------------------------------------------------
-    # Diagnostic information
+    # Diagnostics without dumping the complete response
     # ------------------------------------------------------------------------
 
     message_attributes = []
 
     if message is not None:
 
-        message_attributes = [
-            attribute
-            for attribute in dir(message)
-            if not attribute.startswith("_")
-        ]
+        try:
+            message_attributes = [
+                attribute
+                for attribute in dir(message)
+                if not attribute.startswith("_")
+            ]
+        except Exception:
+            message_attributes = []
 
     logger.error(
-        "Hugging Face returned a response "
-        "without usable text. "
-        "result_type=%s "
-        "choice_type=%s "
-        "message_type=%s "
+        "Hugging Face returned no usable text. "
+        "result_type=%s choice_type=%s message_type=%s "
         "message_attributes=%s",
         type(result).__name__,
         type(choice).__name__,
@@ -435,6 +438,7 @@ def _is_retryable(
         "TOO MANY REQUESTS",
         "SERVER ERROR",
         "GATEWAY",
+        "CAPACITY_EXHAUSTED",
         "CONNECTION RESET",
         "CONNECTION ERROR",
     )
@@ -466,7 +470,8 @@ async def _hf_chat(
 
     - text-only prompts
     - image + text VLM prompts
-    - optional JSON response mode
+    - JSON response mode
+    - automatic fallback when response_format is unsupported
     """
 
     if image_data_uri:
@@ -495,7 +500,7 @@ async def _hf_chat(
         }
     ]
 
-    request_kwargs = {
+    base_kwargs = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
@@ -503,25 +508,19 @@ async def _hf_chat(
     }
 
     # ------------------------------------------------------------------------
-    # JSON response mode
-    #
-    # Only enable when explicitly requested.
-    #
-    # Vision providers are left without JSON mode because provider
-    # compatibility varies for multimodal requests.
+    # JSON mode
     # ------------------------------------------------------------------------
 
-    if json_mode:
+    request_kwargs = dict(base_kwargs)
 
+    if json_mode:
         request_kwargs["response_format"] = {
-            "type": "json_object"
+            "type": "json_object",
         }
 
     last_exception = None
 
-    for attempt in range(
-        MAX_RETRIES
-    ):
+    for attempt in range(MAX_RETRIES):
 
         try:
 
@@ -530,35 +529,66 @@ async def _hf_chat(
                 **request_kwargs,
             )
 
-            return _message_text(
-                result
-            )
+            return _message_text(result)
 
         except Exception as exc:
 
             last_exception = exc
 
-            retryable = _is_retryable(
-                exc
-            )
-
-            logger.warning(
-                "Hugging Face request failed "
-                "(attempt %s/%s, retryable=%s): %s",
-                attempt + 1,
-                MAX_RETRIES,
-                retryable,
-                exc,
-            )
+            error_text = str(exc)
 
             # ----------------------------------------------------------------
-            # Do not retry deterministic response-format problems.
+            # Some providers/models do not implement response_format.
+            #
+            # Retry once without response_format rather than immediately
+            # failing a perfectly valid JSON prompt.
             # ----------------------------------------------------------------
 
             if (
+                json_mode
+                and "response_format" in request_kwargs
+                and any(
+                    marker in error_text.lower()
+                    for marker in (
+                        "response_format",
+                        "json_object",
+                        "unsupported",
+                        "not supported",
+                    )
+                )
+            ):
+
+                logger.warning(
+                    "HF provider does not appear to support "
+                    "response_format for model=%s. "
+                    "Retrying with prompt-enforced JSON.",
+                    model,
+                )
+
+                request_kwargs = dict(base_kwargs)
+
+                continue
+
+            retryable = _is_retryable(exc)
+
+            logger.warning(
+                "Hugging Face request failed "
+                "(attempt %s/%s, retryable=%s, model=%s, provider=%s): %s",
+                attempt + 1,
+                MAX_RETRIES,
+                retryable,
+                model,
+                getattr(
+                    client,
+                    "provider",
+                    "unknown",
+                ),
+                exc,
+            )
+
+            if (
                 not retryable
-                or attempt
-                == MAX_RETRIES - 1
+                or attempt == MAX_RETRIES - 1
             ):
                 break
 
@@ -579,20 +609,73 @@ async def _hf_chat(
 # IMAGE DATA URI
 # ============================================================================
 
+def _detect_mime_type(
+    image_bytes: bytes,
+) -> str:
+    """
+    Detect common image MIME types from magic bytes.
+
+    Falls back to image/jpeg.
+    """
+
+    if not image_bytes:
+        return "image/jpeg"
+
+    # JPEG
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+
+    # PNG
+    if image_bytes.startswith(
+        b"\x89PNG\r\n\x1a\n"
+    ):
+        return "image/png"
+
+    # GIF
+    if image_bytes.startswith(
+        b"GIF87a"
+    ) or image_bytes.startswith(
+        b"GIF89a"
+    ):
+        return "image/gif"
+
+    # WEBP
+    if (
+        image_bytes.startswith(b"RIFF")
+        and b"WEBP" in image_bytes[:16]
+    ):
+        return "image/webp"
+
+    # BMP
+    if image_bytes.startswith(b"BM"):
+        return "image/bmp"
+
+    return "image/jpeg"
+
+
 def _data_uri(
     image_bytes: bytes,
 ) -> str:
     """
-    Convert image bytes into a JPEG base64 data URI.
+    Convert image bytes into a base64 data URI.
     """
+
+    if not image_bytes:
+        raise ValueError(
+            "Cannot create data URI from empty image."
+        )
+
+    mime_type = _detect_mime_type(
+        image_bytes
+    )
 
     encoded = base64.b64encode(
         image_bytes
     ).decode("ascii")
 
     return (
-        "data:image/jpeg;base64,"
-        + encoded
+        f"data:{mime_type};base64,"
+        f"{encoded}"
     )
 
 
@@ -651,6 +734,8 @@ class HFVisionProvider(
                 image_data_uri=_data_uri(
                     image_bytes
                 ),
+                # Keep false for maximum compatibility
+                # with multimodal provider implementations.
                 json_mode=False,
             )
 
@@ -687,14 +772,18 @@ class HFVisionProvider(
     ) -> HumanDetectionResult:
 
         prompt = """
-Analyze this image STRICTLY for visible human presence.
+You are the safety gate for SnapTale.
 
-Return true if ANY of the following is visible anywhere:
+Analyze this image ONLY for visible real human presence.
 
-- human
+SnapTale supports animals and non-human objects only.
+
+Return true if ANY real human content is visible anywhere,
+including:
+
 - person
-- face
-- body
+- human face
+- human body
 - hand
 - arm
 - leg
@@ -702,12 +791,16 @@ Return true if ANY of the following is visible anywhere:
 - human silhouette
 - person in background
 - human reflection
-- human body part
-- human-like visible body part belonging to a real person
+- visible human body part
 
-Return false ONLY when no human is visible.
+If even a small visible part of a real person is present,
+return is_human_present=true.
 
-Do not infer:
+Important:
+
+Do NOT identify the person.
+
+Do NOT infer:
 
 - identity
 - age
@@ -716,11 +809,14 @@ Do not infer:
 - religion
 - health
 - personality
-- sensitive attributes
+- socioeconomic status
+- other sensitive attributes
 
-This is a safety gate.
+This is a safety classification task.
 
-Return ONLY JSON in exactly this structure:
+Return ONLY valid JSON.
+
+Use exactly:
 
 {
   "is_human_present": false,
@@ -728,13 +824,17 @@ Return ONLY JSON in exactly this structure:
   "detected_labels": []
 }
 
-If a human is visible, return:
+If a human is visible:
 
 {
   "is_human_present": true,
   "confidence": 0.95,
   "detected_labels": ["person"]
 }
+
+No markdown.
+No explanation.
+No additional fields.
 """
 
         data = await self._vision_json(
@@ -781,24 +881,39 @@ If a human is visible, return:
     ) -> VisionAnalysisOutput:
 
         prompt = """
-Analyze this NON-HUMAN image.
+Analyze this image for SnapTale.
+
+The image has already passed a separate human-presence
+safety gate.
+
+Analyze ONLY the primary non-human subject.
 
 Identify:
 
-- primary non-human subject
-- category
-- breed/type
-- dominant color
+- primary subject
+- broad category
+- breed/type if visually reasonable
+- dominant visible color
 - environment
-- visible objects
-- estimated expression/mood
+- visible non-human objects
+- visible expression or apparent mood
 
-The image has already passed the server-side
-human detection gate.
+Do not identify or infer any human.
 
-Do NOT identify or infer humans.
+Do not infer sensitive human attributes.
 
-Return ONLY JSON:
+If the image contains a person or human body part,
+set:
+
+"is_human_present": true
+
+Otherwise set:
+
+"is_human_present": false
+
+Return ONLY valid JSON.
+
+Exactly:
 
 {
   "subject": "string",
@@ -810,6 +925,10 @@ Return ONLY JSON:
   "estimated_expression": "string",
   "is_human_present": false
 }
+
+No markdown.
+No explanation.
+No additional fields.
 """
 
         data = await self._vision_json(
@@ -817,7 +936,9 @@ Return ONLY JSON:
             prompt,
         )
 
-        # Defense-in-depth safety check.
+        # --------------------------------------------------------------------
+        # Defense-in-depth safety check
+        # --------------------------------------------------------------------
 
         if bool(
             data.get(
@@ -935,8 +1056,11 @@ class HFStoryProvider(
     ) -> CharacterDNA:
 
         prompt = f"""
-Create a persistent Character DNA for an
-entertainment app called SnapTale.
+Create a persistent Character DNA for
+an entertainment app called SnapTale.
+
+The character MUST be based on a non-human
+animal or object.
 
 Non-human visual subject:
 {vision.subject}
@@ -959,13 +1083,19 @@ Expression:
 Preferred language:
 {preferred_language}
 
-The voice should support natural conversational
-Telugu-English "naatu naatu maatalu" code-switching.
+Voice requirements:
+
+- natural conversational Telugu-English
+- casual friend-group style
+- "naatu naatu maatalu"
+- natural code-switching
+- not textbook Telugu
+- not robotic translation
 
 DO NOT imitate living actors, comedians,
 celebrities or real people.
 
-Select one original comedy archetype:
+Select exactly ONE original comedy archetype:
 
 [
   confused_legend,
@@ -982,7 +1112,11 @@ Select one original comedy archetype:
   dark_deadpan
 ]
 
-Return ONLY JSON adhering to CharacterDNA.
+Make the character memorable but original.
+
+Return ONLY valid JSON matching CharacterDNA.
+
+Required structure:
 
 {{
   "name": "Creative Name",
@@ -1025,6 +1159,10 @@ Return ONLY JSON adhering to CharacterDNA.
   "english_mix": 0.35,
   "punchline_frequency": 0.85
 }}
+
+No markdown.
+No explanation.
+No additional fields.
 """
 
         data = await self._generate_json(
@@ -1104,14 +1242,26 @@ Mode:
 {mode}
 
 SnapTale:
-General entertainment, comedy, memes,
-absurdity, sarcasm, chaos, adventure
-and cinematic storytelling.
+General entertainment including:
+
+- comedy
+- memes
+- absurdity
+- sarcasm
+- chaos
+- adventure
+- cinematic storytelling
+- unexpected twists
 
 SnapTale+:
-Mature, darker comedy, savage humor,
-horror, thriller and sophisticated
-mature themes.
+Mature entertainment including:
+
+- darker comedy
+- savage humor
+- horror
+- thriller
+- sophisticated mature themes
+- stronger conversational language where appropriate
 
 Setting:
 {dice.setting}
@@ -1129,14 +1279,23 @@ Language:
 {language}
 
 Tone:
-Natural conversational Telugu-English,
-"naatu naatu maatalu" code-switching.
+
+Natural conversational Telugu-English.
+
+Use:
+"naatu naatu maatalu"
 
 Do not write textbook Telugu.
-Do not mechanically translate English.
-Make dialogue sound like friends actually talking.
 
-Do not imitate any real actor or comedian.
+Do not mechanically translate English.
+
+Make dialogue sound like real friends talking.
+
+The character must remain an original fictional
+non-human character.
+
+Do not imitate any real actor, comedian,
+celebrity or public figure.
 
 {custom_direction}
 
@@ -1144,20 +1303,29 @@ Follow this narrative structure:
 
 {structure}
 
-SnapTale should NOT make every sentence
-a joke.
+SnapTale should NOT make every sentence a joke.
 
-Maintain a real beginning, conflict,
-twist and ending.
+Maintain:
+
+- beginning
+- conflict
+- character motivation
+- escalation
+- twist
+- ending
 
 SnapTale+ should prioritize:
 
-setup
-misdirection
-escalation
-punchline
-reaction
-whistle moment
+- setup
+- misdirection
+- escalation
+- punchline
+- reaction
+- whistle moment
+
+The humor should come from timing,
+personality and situation rather than
+constant profanity.
 
 Return ONLY this JSON object:
 
@@ -1166,6 +1334,9 @@ Return ONLY this JSON object:
   "content": "Full story",
   "punchline": "Memorable short punchline"
 }}
+
+No markdown.
+No explanation.
 """
 
         return await self._generate_json(
@@ -1227,14 +1398,13 @@ Language:
 
 Keep the character's core personality intact.
 
-Shift the tone and genre to match
-the mutation.
+Shift the tone and genre to match the mutation.
 
 Use natural conversational
 Telugu-English when appropriate.
 
-Do not imitate real actors
-or comedians.
+Do not imitate real actors,
+comedians or celebrities.
 
 Return ONLY this JSON object:
 
@@ -1243,6 +1413,9 @@ Return ONLY this JSON object:
   "content": "Full mutated story",
   "punchline": "Short punchline"
 }}
+
+No markdown.
+No explanation.
 """
 
         return await self._generate_json(
@@ -1297,6 +1470,9 @@ Keep the character recognizable.
 Use natural conversational
 Telugu-English when appropriate.
 
+Do not imitate real actors,
+comedians or celebrities.
+
 Return ONLY this JSON object:
 
 {{
@@ -1304,6 +1480,9 @@ Return ONLY this JSON object:
   "content": "Full alternate-reality story",
   "punchline": "Short punchline"
 }}
+
+No markdown.
+No explanation.
 """
 
         return await self._generate_json(
@@ -1365,6 +1544,9 @@ Maintain character continuity.
 Use natural conversational
 Telugu-English when appropriate.
 
+Do not imitate real actors,
+comedians or celebrities.
+
 Return ONLY this JSON object:
 
 {{
@@ -1372,6 +1554,9 @@ Return ONLY this JSON object:
   "content": "Full next-chapter story",
   "punchline": "Short punchline"
 }}
+
+No markdown.
+No explanation.
 """
 
         return await self._generate_json(
@@ -1406,15 +1591,14 @@ Return ONLY this JSON object:
         )
 
         universe_text = (
-            f"Universe context: "
-            f"{universe_context}"
+            f"Universe context: {universe_context}"
             if universe_context
             else ""
         )
 
         content_mode = (
             "SnapTale+ "
-            "(edgier, dark comedy allowed)"
+            "(edgier dark comedy allowed)"
             if is_snapplus
             else
             "SnapTale "
@@ -1446,6 +1630,12 @@ Speak in conversational Telugu-English
 code-switching matching this character's
 established voice.
 
+Use natural "naatu naatu maatalu".
+
+Do not sound like a textbook.
+
+Do not mechanically translate English.
+
 Do not imitate a real actor,
 comedian or celebrity.
 
@@ -1462,12 +1652,14 @@ User's new message:
 
 "{message}"
 
-Respond with a single short,
+Respond with ONE short,
 in-character reply.
 
 Plain text only.
+
 No JSON.
-No quotation marks around the whole reply.
+No markdown.
+No quotation marks around the entire reply.
 """
 
         try:
@@ -1552,14 +1744,14 @@ class HFImageProvider(
 
             tone = (
                 "moody cinematic dark-comedy "
-                "thriller"
+                "thriller illustration"
             )
 
         else:
 
             tone = (
-                "bright playful meme-style "
-                "comedic illustration"
+                "bright playful surreal "
+                "meme-style comedic illustration"
             )
 
         prompt = f"""
@@ -1589,17 +1781,18 @@ Style:
 
 Requirements:
 
-- No humans
-- No human faces
-- No human bodies
-- No human silhouettes
-- No text
-- No lettering
-- No logos
-- No watermarks
-- Keep protagonist non-human
-- Preserve visual identity
-- Original fictional artwork
+- non-human protagonist only
+- no humans
+- no human faces
+- no human bodies
+- no human silhouettes
+- no human body parts
+- no text
+- no lettering
+- no logos
+- no watermarks
+- preserve protagonist visual identity
+- original fictional artwork
 """
 
         try:
@@ -1664,12 +1857,11 @@ class HFModerationProvider(
     ):
 
         # --------------------------------------------------------------------
-        # IMPORTANT:
+        # Text moderation -> TEXT provider
+        # Image moderation -> VISION provider
         #
-        # Text moderation uses the TEXT provider.
-        # Image moderation uses the VISION provider.
-        #
-        # We therefore maintain two clients.
+        # This prevents accidentally sending a text moderation request
+        # through a VLM-only provider.
         # --------------------------------------------------------------------
 
         self.text_client = _init_client(
@@ -1748,16 +1940,19 @@ Block:
 Edgy fictional comedy alone is NOT
 automatically unsafe.
 
-Review:
+Review this content:
 
 {text!r}
 
-Return ONLY this JSON:
+Return ONLY valid JSON:
 
 {{
   "is_safe": true,
   "reason": "short explanation"
 }}
+
+No markdown.
+No additional fields.
 """
 
         try:
@@ -1845,9 +2040,11 @@ Return ONLY this JSON:
             }
 
         prompt = """
-Review this generated image.
+Review this generated image for SnapTale.
 
-Block:
+SnapTale uses fictional non-human protagonists.
+
+Block if the generated image contains:
 
 - explicit sexual content
 - gore
@@ -1856,17 +2053,21 @@ Block:
 - real identifiable human faces
 - real people
 - human bodies
+- human body parts
+- human silhouettes
 - severe harmful content
 
-SnapTale uses fictional
-non-human protagonists.
+The image should contain a non-human protagonist.
 
-Return ONLY JSON:
+Return ONLY valid JSON:
 
 {
   "is_safe": true,
   "reason": "short explanation"
 }
+
+No markdown.
+No additional fields.
 """
 
         try:
@@ -1898,8 +2099,7 @@ Return ONLY JSON:
                 "is_safe": safe,
                 "reason": data.get(
                     "reason",
-                    "Reviewed by Hugging Face "
-                    "vision model",
+                    "Reviewed by Hugging Face vision model",
                 ),
                 "action": (
                     "allow"
