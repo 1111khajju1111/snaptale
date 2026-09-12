@@ -99,3 +99,8 @@ class BaseModerationProvider(ABC):
     async def check_content_safety(self, text: str, is_snapplus: bool = False) -> Dict[str, Any]:
         """Block disallowed harmful content while allowing dark comedy in SnapTale+."""
         pass
+
+    @abstractmethod
+    async def check_image_safety(self, image_bytes: bytes, is_snapplus: bool = False) -> Dict[str, Any]:
+        """Check the actual generated image bytes for unsafe visual content (not just its text description)."""
+        pass

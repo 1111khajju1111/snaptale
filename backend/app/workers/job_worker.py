@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 from typing import Dict, Set, Optional
-from fastapi import WebSocket
+from fastapi import WebSocket, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.models.models import GenerationJob, Story, Character
@@ -12,6 +12,7 @@ import app.core.database as db_module
 from app.services.character_engine import create_or_persist_character
 from app.services.human_detection import validate_and_detect_human
 from app.services.story_dice import roll_story_dice
+from app.services.image_safety import is_generated_image_safe
 from app.ai import story_provider, image_provider, moderation_provider
 
 class JobConnectionManager:
@@ -152,17 +153,17 @@ async def process_generation_job(
                 mode=experience_mode
             )
 
-            # 8. GENERATED IMAGE MODERATION (Verify generated image and prompt safety)
+            # 8. GENERATED IMAGE MODERATION (checks the actual generated image bytes,
+            # not just a text description of the scene, whenever real bytes are
+            # available; fails closed rather than degrading to text-only checks
+            # under AI_PROVIDER=gemini)
             await update_stage("image_moderation", 92)
-            try:
-                img_safety = await moderation_provider.check_content_safety(
-                    f"Generated visual scene for {story_dict['title']}: {active_dice.setting}",
-                    is_snapplus=(experience_mode == "snapplus")
-                )
-                if not img_safety.get("is_safe", True):
-                    mod_status = "flagged"
-            except Exception:
-                pass
+            image_is_safe = await is_generated_image_safe(
+                generated_img_url, active_dice.setting, story_dict["title"],
+                is_snapplus=(experience_mode == "snapplus")
+            )
+            if not image_is_safe:
+                mod_status = "flagged"
 
             # 9. PERSIST STORY
             story = Story(

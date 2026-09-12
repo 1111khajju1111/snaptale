@@ -1,5 +1,5 @@
-import os
 import json
+import base64
 import logging
 from typing import List, Dict, Optional, Any
 from fastapi import HTTPException, status
@@ -9,32 +9,77 @@ from app.ai.base import (
 from app.schemas.photo import HumanDetectionResult, VisionAnalysisOutput
 from app.schemas.character import CharacterDNA, SpeechStyle
 from app.schemas.story import StoryDiceRoll
-from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Current (Sep 2026) supported Gemini models. gemini-1.5-flash was fully shut
+# down (404s on every request); gemini-2.5-flash-image is scheduled to shut
+# down Oct 2, 2026, too close to a new deployment to build against.
+TEXT_MODEL_NAME = "gemini-3.5-flash"       # general-purpose multimodal text/vision GA model
+IMAGE_MODEL_NAME = "gemini-3.1-flash-image"  # "Nano Banana 2", GA image generation model
+
+
+def _unavailable(detail: str) -> HTTPException:
+    """Fail-closed 503. Every Gemini-backed provider in this file raises this on any
+    failure (client not initialized, API error, malformed response) instead of ever
+    falling back to mock/placeholder output. Mock output belongs only behind
+    AI_PROVIDER=mock, selected explicitly in app/ai/__init__.py — never as a silent
+    degradation path inside a "real" provider."""
+    return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail)
+
+
+def _init_client(api_key: str):
+    """Shared google-genai client init. Returns None on failure; every caller must
+    treat None as fail-closed (raise _unavailable), never as a cue to use mock data."""
+    try:
+        from google import genai
+        return genai.Client(api_key=api_key)
+    except Exception as e:
+        logger.warning(f"Failed to initialize google-genai client: {e}")
+        return None
+
+
+def _parse_json_response(text: str) -> dict:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+    return json.loads(cleaned.strip())
+
+
+def _safety_block_reason(response) -> Optional[str]:
+    """Inspect Gemini's own safety ratings/finish reason on a response, independent
+    of whatever the model said in its text output. Used so moderation doesn't rely
+    solely on the model self-reporting via JSON."""
+    feedback = getattr(response, "prompt_feedback", None)
+    block_reason = getattr(feedback, "block_reason", None)
+    if block_reason:
+        return f"Blocked by safety filter: {block_reason}"
+
+    for candidate in (getattr(response, "candidates", None) or []):
+        finish_reason = str(getattr(candidate, "finish_reason", ""))
+        if finish_reason and finish_reason.upper() not in ("STOP", "1", "FINISH_REASON_STOP"):
+            return f"Blocked by safety filter: {finish_reason}"
+        for rating in (getattr(candidate, "safety_ratings", None) or []):
+            probability = str(getattr(rating, "probability", "")).upper()
+            if probability in ("HIGH", "MEDIUM"):
+                category = getattr(rating, "category", "unknown_category")
+                return f"Flagged for {category} ({probability} probability)"
+    return None
+
 
 class GeminiVisionProvider(BaseVisionProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel("gemini-1.5-flash")
-        except Exception as e:
-            logger.warning(f"Failed to initialize google.generativeai: {e}")
-            self.model = None
+        self.client = _init_client(api_key)
 
     async def detect_human(self, image_bytes: bytes, filename: str = "") -> HumanDetectionResult:
-        if not self.model:
-            if settings.AI_PROVIDER == "gemini" or settings.APP_ENV == "production":
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Human detection service is unavailable. Photo cannot be safely verified."
-                )
-            from app.ai.mock_provider import MockVisionProvider
-            return await MockVisionProvider().detect_human(image_bytes, filename)
+        if not self.client:
+            raise _unavailable("Human detection service is unavailable. Photo cannot be safely verified.")
 
         try:
+            from google.genai import types
             prompt = """
 Analyze this image strictly for human presence.
 Does this image contain ANY human being, person, face, selfie, portrait, body, child, or group of people?
@@ -42,24 +87,25 @@ Even if an animal or object is the main subject, if any human is visible anywher
 Output ONLY JSON in this format:
 {"is_human_present": true/false, "confidence": float, "detected_labels": ["list", "of", "labels"]}
 """
-            response = self.model.generate_content([prompt, {"mime_type": "image/jpeg", "data": image_bytes}])
-            clean_text = response.text.strip().strip("```json").strip("```")
-            data = json.loads(clean_text)
+            response = await self.client.aio.models.generate_content(
+                model=TEXT_MODEL_NAME,
+                contents=[prompt, types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")]
+            )
+            data = _parse_json_response(response.text)
             return HumanDetectionResult(**data)
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Gemini human detection error: {e}")
-            # FAIL CLOSED: Never fall back to a permissive mock when real detection fails
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Human detection service encountered an error and failed closed. Please try again."
-            )
+            # FAIL CLOSED: never fall back to filename/magic-byte mock detection here.
+            raise _unavailable("Human detection service encountered an error and failed closed. Please try again.")
 
     async def analyze_non_human(self, image_bytes: bytes) -> VisionAnalysisOutput:
-        if not self.model:
-            from app.ai.mock_provider import MockVisionProvider
-            return await MockVisionProvider().analyze_non_human(image_bytes)
+        if not self.client:
+            raise _unavailable("Vision analysis service is unavailable.")
 
         try:
+            from google.genai import types
             prompt = """
 Analyze this NON-HUMAN image. Identify:
 1. Primary non-human subject (e.g. dog, cat, tea glass, chair, vintage car)
@@ -81,34 +127,42 @@ Output ONLY JSON in this format:
   "is_human_present": false
 }
 """
-            response = self.model.generate_content([prompt, {"mime_type": "image/jpeg", "data": image_bytes}])
-            clean_text = response.text.strip().strip("```json").strip("```")
-            data = json.loads(clean_text)
+            response = await self.client.aio.models.generate_content(
+                model=TEXT_MODEL_NAME,
+                contents=[prompt, types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")]
+            )
+            data = _parse_json_response(response.text)
             return VisionAnalysisOutput(**data)
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Gemini vision analysis error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Vision analysis service unavailable."
-            )
+            raise _unavailable("Vision analysis service unavailable.")
+
 
 class GeminiStoryProvider(BaseStoryProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
+        self.client = _init_client(api_key)
+
+    async def _generate_json(self, prompt: str) -> dict:
+        if not self.client:
+            raise _unavailable("Story generation service is unavailable.")
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel("gemini-1.5-flash")
+            response = await self.client.aio.models.generate_content(
+                model=TEXT_MODEL_NAME,
+                contents=prompt
+            )
+            return _parse_json_response(response.text)
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.warning(f"Failed to initialize google.generativeai: {e}")
-            self.model = None
+            logger.error(f"Gemini story generation error: {e}")
+            # FAIL CLOSED: no mock-story fallback for a configured real provider.
+            raise _unavailable("Story generation failed and will not fall back to placeholder content. Please try again.")
 
     async def generate_character_dna(self, vision: VisionAnalysisOutput, preferred_language: str = "te-en") -> CharacterDNA:
-        from app.ai.mock_provider import MockStoryProvider
-        if not self.model:
-            return await MockStoryProvider().generate_character_dna(vision, preferred_language)
-        try:
-            prompt = f"""
+        prompt = f"""
 Create a persistent Character DNA for an entertainment app called SnapTale.
 Non-human visual subject: {vision.subject} ({vision.category}, {vision.breed_or_type}, color: {vision.color}, environment: {vision.environment}, expression: {vision.estimated_expression}).
 Preferred language style: {preferred_language} (Support natural conversational Telugu-English 'naatu naatu maatalu' code-switching).
@@ -138,13 +192,8 @@ Return ONLY JSON adhering to CharacterDNA:
   "punchline_frequency": 0.85
 }}
 """
-            response = self.model.generate_content(prompt)
-            clean_text = response.text.strip().strip("```json").strip("```")
-            data = json.loads(clean_text)
-            return CharacterDNA(**data)
-        except Exception as e:
-            logger.error(f"Gemini generate_character_dna error: {e}")
-            return await MockStoryProvider().generate_character_dna(vision, preferred_language)
+        data = await self._generate_json(prompt)
+        return CharacterDNA(**data)
 
     async def generate_story(
         self,
@@ -154,23 +203,20 @@ Return ONLY JSON adhering to CharacterDNA:
         language: str = "te-en",
         custom_prompt: Optional[str] = None
     ) -> Dict[str, str]:
-        from app.ai.mock_provider import MockStoryProvider
-        if not self.model:
-            return await MockStoryProvider().generate_story(character_dna, dice, mode, language, custom_prompt)
-        try:
-            is_mature = (mode == "snapplus")
-            structure = (
-                "SETUP -> MISDIRECTION -> ESCALATION -> PUNCHLINE -> REACTION -> WHISTLE MOMENT"
-                if is_mature else
-                "SETUP -> CHARACTER -> PROBLEM -> CONFLICT -> TWIST -> CLIMAX -> ENDING"
-            )
-            prompt = f"""
+        is_mature = (mode == "snapplus")
+        structure = (
+            "SETUP -> MISDIRECTION -> ESCALATION -> PUNCHLINE -> REACTION -> WHISTLE MOMENT"
+            if is_mature else
+            "SETUP -> CHARACTER -> PROBLEM -> CONFLICT -> TWIST -> CLIMAX -> ENDING"
+        )
+        prompt = f"""
 You are the master entertainment writer for SnapTale.
 Character: {character_dna.name} ({character_dna.species_or_object})
 Archetype: {character_dna.comedy_archetype}
 Mode: {mode} (SnapTale+ is mature/dark comedy/thriller; SnapTale is general humor/meme/absurdity)
 Setting: {dice.setting}, Goal: {dice.goal}, Twist: {dice.twist}, Chaos Mode: {dice.chaos_mode}
-Tone: Conversational Telugu-English ('naatu naatu maatalu' code switching like 'Bro literally cooked himself', 'ఏంట్రా ఇది 💀', 'Situation full ga out of control ayipoyindi ra!').
+{f"Additional custom direction: {custom_prompt}" if custom_prompt else ""}
+Tone: Conversational Telugu-English ('naatu naatu maatalu' code switching).
 Follow narrative structure: {structure}.
 
 Return ONLY JSON:
@@ -180,25 +226,272 @@ Return ONLY JSON:
   "punchline": "Memorable short punchline for story card"
 }}
 """
-            response = self.model.generate_content(prompt)
-            clean_text = response.text.strip().strip("```json").strip("```")
-            return json.loads(clean_text)
+        return await self._generate_json(prompt)
+
+    async def mutate_story(
+        self,
+        original_story_content: str,
+        character_dna: CharacterDNA,
+        mutation_type: str,
+        mode: str = "snaptale",
+        language: str = "te-en",
+        custom_instruction: Optional[str] = None
+    ) -> Dict[str, str]:
+        prompt = f"""
+You are branching an existing SnapTale story into an alternate version without overwriting the original.
+Character: {character_dna.name} ({character_dna.species_or_object}), archetype: {character_dna.comedy_archetype}.
+Original story:
+\"\"\"{original_story_content}\"\"\"
+
+Mutation type: {mutation_type}
+{f"Custom instruction: {custom_instruction}" if custom_instruction else ""}
+Mode: {mode}. Keep the character's core personality intact but shift tone/genre to match the mutation type.
+
+Return ONLY JSON:
+{{"title": "New branch title", "content": "Full mutated story", "punchline": "Short punchline"}}
+"""
+        return await self._generate_json(prompt)
+
+    async def what_if_story(
+        self,
+        original_story_content: str,
+        character_dna: CharacterDNA,
+        scenario: str,
+        mode: str = "snaptale",
+        language: str = "te-en"
+    ) -> Dict[str, str]:
+        prompt = f"""
+Generate a "What If" alternate-reality branch for an existing SnapTale character.
+Character: {character_dna.name} ({character_dna.species_or_object}), archetype: {character_dna.comedy_archetype}.
+Original story:
+\"\"\"{original_story_content}\"\"\"
+
+What if scenario: "{scenario}"
+Mode: {mode}.
+
+Return ONLY JSON:
+{{"title": "What If: ...", "content": "Full alternate-reality story", "punchline": "Short punchline"}}
+"""
+        return await self._generate_json(prompt)
+
+    async def continue_story(
+        self,
+        previous_story_content: str,
+        character_dna: CharacterDNA,
+        direction: Optional[str] = None,
+        mode: str = "snaptale",
+        language: str = "te-en"
+    ) -> Dict[str, str]:
+        prompt = f"""
+Continue this SnapTale story with the next chapter, without rewriting what came before.
+Character: {character_dna.name} ({character_dna.species_or_object}), archetype: {character_dna.comedy_archetype}.
+Previous chapter:
+\"\"\"{previous_story_content}\"\"\"
+
+{f"Requested direction: {direction}" if direction else "Continue the natural next beat of the story."}
+Mode: {mode}.
+
+Return ONLY JSON:
+{{"title": "Next chapter title", "content": "Full next-chapter story", "punchline": "Short punchline"}}
+"""
+        return await self._generate_json(prompt)
+
+    async def chat_response(
+        self,
+        character_dna: CharacterDNA,
+        chat_history: List[Dict[str, str]],
+        message: str,
+        universe_context: Optional[str] = None,
+        is_snapplus: bool = False
+    ) -> str:
+        if not self.client:
+            raise _unavailable("Chat service is unavailable.")
+
+        history_text = "\n".join(
+            f"{turn.get('role', 'user')}: {turn.get('content', '')}" for turn in (chat_history or [])
+        )
+        prompt = f"""
+You are roleplaying in-character as {character_dna.name}, a {character_dna.species_or_object}.
+Personality: {', '.join(character_dna.personality)}. Archetype: {character_dna.comedy_archetype}.
+Secret: {character_dna.secret}. Occupation: {character_dna.occupation}.
+Speak in conversational Telugu-English code-switching matching this character's established voice.
+{f"Universe context: {universe_context}" if universe_context else ""}
+Content mode: {"SnapTale+ (edgier, dark comedy allowed)" if is_snapplus else "SnapTale (general audience)"}.
+
+Conversation so far:
+{history_text}
+
+User's new message: "{message}"
+
+Respond with a single short, in-character reply. Plain text only, no JSON, no quotation marks around the whole reply.
+"""
+        try:
+            response = await self.client.aio.models.generate_content(
+                model=TEXT_MODEL_NAME,
+                contents=prompt
+            )
+            block_reason = _safety_block_reason(response)
+            if block_reason:
+                raise _unavailable(f"Chat response was blocked by safety filters: {block_reason}")
+            return response.text.strip()
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Gemini generate_story error: {e}")
-            return await MockStoryProvider().generate_story(character_dna, dice, mode, language, custom_prompt)
+            logger.error(f"Gemini chat response error: {e}")
+            raise _unavailable("Chat service failed and will not fall back to placeholder dialogue. Please try again.")
 
-    async def mutate_story(self, original_story_content: str, character_dna: CharacterDNA, mutation_type: str, mode: str = "snaptale", language: str = "te-en", custom_instruction: Optional[str] = None) -> Dict[str, str]:
-        from app.ai.mock_provider import MockStoryProvider
-        return await MockStoryProvider().mutate_story(original_story_content, character_dna, mutation_type, mode, language, custom_instruction)
 
-    async def what_if_story(self, original_story_content: str, character_dna: CharacterDNA, scenario: str, mode: str = "snaptale", language: str = "te-en") -> Dict[str, str]:
-        from app.ai.mock_provider import MockStoryProvider
-        return await MockStoryProvider().what_if_story(original_story_content, character_dna, scenario, mode, language)
+class GeminiImageProvider(BaseImageProvider):
+    """Generates a real, story-unique image via Gemini's current image-generation
+    model. Never returns a fixed/stock placeholder — on any failure this fails
+    closed (503) rather than silently substituting mock/stock imagery."""
 
-    async def continue_story(self, previous_story_content: str, character_dna: CharacterDNA, direction: Optional[str] = None, mode: str = "snaptale", language: str = "te-en") -> Dict[str, str]:
-        from app.ai.mock_provider import MockStoryProvider
-        return await MockStoryProvider().continue_story(previous_story_content, character_dna, direction, mode, language)
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.client = _init_client(api_key)
 
-    async def chat_response(self, character_dna: CharacterDNA, chat_history: List[Dict[str, str]], message: str, universe_context: Optional[str] = None, is_snapplus: bool = False) -> str:
-        from app.ai.mock_provider import MockStoryProvider
-        return await MockStoryProvider().chat_response(character_dna, chat_history, message, universe_context, is_snapplus)
+    async def generate_story_image(
+        self,
+        character_dna: CharacterDNA,
+        story_title: str,
+        scene_summary: str,
+        mode: str = "snaptale"
+    ) -> str:
+        if not self.client:
+            raise _unavailable("Image generation service is unavailable. Story cannot be illustrated right now.")
+
+        try:
+            from google.genai import types
+            appearance = ", ".join(f"{k}: {v}" for k, v in (character_dna.appearance or {}).items())
+            tone = (
+                "moody, cinematic, slightly dark comedic thriller lighting"
+                if mode == "snapplus" else
+                "bright, playful, meme-style comedic illustration"
+            )
+            prompt = f"""
+Create a single vivid illustration for a short-form comedic story app.
+Subject: {character_dna.name}, a {character_dna.species_or_object} character with personality traits {', '.join(character_dna.personality)}.
+Visual appearance details: {appearance or 'as photographed'}.
+Scene: {scene_summary}. Story title: "{story_title}".
+Style: {tone}. No text or lettering rendered in the image. No real, identifiable human beings.
+"""
+            response = await self.client.aio.models.generate_content(
+                model=IMAGE_MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_modalities=["IMAGE"])
+            )
+
+            image_bytes = None
+            mime_type = "image/png"
+            for candidate in (getattr(response, "candidates", None) or []):
+                parts = getattr(getattr(candidate, "content", None), "parts", None) or []
+                for part in parts:
+                    inline_data = getattr(part, "inline_data", None)
+                    if inline_data and getattr(inline_data, "data", None):
+                        image_bytes = inline_data.data
+                        mime_type = getattr(inline_data, "mime_type", mime_type)
+                        break
+                if image_bytes:
+                    break
+
+            if not image_bytes:
+                raise ValueError("Gemini response contained no image data")
+
+            b64 = base64.b64encode(image_bytes).decode("utf-8")
+            return f"data:{mime_type};base64,{b64}"
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Gemini image generation error: {e}")
+            raise _unavailable("Image generation failed and will not fall back to placeholder imagery. Please try again.")
+
+
+class GeminiModerationProvider(BaseModerationProvider):
+    """Real moderation backed by Gemini's safety ratings plus an explicit
+    safety-review prompt, covering both generated text and generated image bytes.
+    Fails closed: if the moderation call itself is unavailable, content is treated
+    as unsafe rather than silently allowed through."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.client = _init_client(api_key)
+
+    async def check_content_safety(self, text: str, is_snapplus: bool = False) -> Dict[str, Any]:
+        if not self.client:
+            raise _unavailable("Moderation service is unavailable. Content cannot be safely verified.")
+
+        try:
+            allowance = (
+                "This app (SnapTale+) permits dark comedy, mild threat/thriller themes and edgy humor "
+                "aimed at fictional non-human characters, but must still block genuinely harmful content."
+                if is_snapplus else
+                "This app (SnapTale) is general-audience comedic content and should apply a stricter, "
+                "family-friendly bar."
+            )
+            prompt = f"""
+You are a content safety reviewer for an entertainment app.
+{allowance}
+Review the following generated story text and determine if it contains any of:
+sexual content involving minors, non-consensual sexual content, instructions for self-harm or suicide,
+credible threats or incitement of real-world violence, hate speech targeting protected groups,
+or any other severe policy violation.
+
+Text to review:
+\"\"\"{text}\"\"\"
+
+Output ONLY JSON: {{"is_safe": true/false, "reason": "short explanation"}}
+"""
+            response = await self.client.aio.models.generate_content(model=TEXT_MODEL_NAME, contents=prompt)
+
+            block_reason = _safety_block_reason(response)
+            if block_reason:
+                return {"is_safe": False, "reason": block_reason, "action": "block"}
+
+            data = _parse_json_response(response.text)
+            is_safe = bool(data.get("is_safe", False))
+            return {
+                "is_safe": is_safe,
+                "reason": data.get("reason", "Reviewed by Gemini moderation"),
+                "action": "allow" if is_safe else "block"
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Gemini content moderation error: {e}")
+            # FAIL CLOSED: an unavailable/broken moderation call must never resolve to "safe".
+            return {"is_safe": False, "reason": "Moderation service error; content blocked as a precaution.", "action": "block"}
+
+    async def check_image_safety(self, image_bytes: bytes, is_snapplus: bool = False) -> Dict[str, Any]:
+        if not self.client:
+            # Cannot inspect the actual image bytes at all: fail closed, do not
+            # fall back to moderating only a text description of the scene.
+            return {"is_safe": False, "reason": "Image moderation service unavailable; cannot verify image.", "action": "block"}
+
+        try:
+            from google.genai import types
+            prompt = """
+Review this image for a comedic entertainment app. Check for:
+sexual/explicit content, gore or graphic violence, hate symbolry, real identifiable human faces,
+or any other severe policy violation.
+Output ONLY JSON: {"is_safe": true/false, "reason": "short explanation"}
+"""
+            response = await self.client.aio.models.generate_content(
+                model=TEXT_MODEL_NAME,
+                contents=[prompt, types.Part.from_bytes(data=image_bytes, mime_type="image/png")]
+            )
+
+            block_reason = _safety_block_reason(response)
+            if block_reason:
+                return {"is_safe": False, "reason": block_reason, "action": "block"}
+
+            data = _parse_json_response(response.text)
+            is_safe = bool(data.get("is_safe", False))
+            return {
+                "is_safe": is_safe,
+                "reason": data.get("reason", "Reviewed by Gemini image moderation"),
+                "action": "allow" if is_safe else "block"
+            }
+        except Exception as e:
+            logger.error(f"Gemini image moderation error: {e}")
+            # FAIL CLOSED here too: an inspection failure is not a pass.
+            return {"is_safe": False, "reason": "Image moderation service error; content blocked as a precaution.", "action": "block"}

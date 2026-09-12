@@ -7,6 +7,7 @@ from app.schemas.story import StoryDiceRoll, StoryCreate
 from app.schemas.character import CharacterDNA
 from app.ai import story_provider, image_provider, moderation_provider
 from app.services.story_dice import roll_story_dice
+from app.services.image_safety import is_generated_image_safe
 
 async def generate_and_save_story(
     db: AsyncSession,
@@ -47,6 +48,14 @@ async def generate_and_save_story(
         scene_summary=active_dice.setting,
         mode=experience_mode
     )
+
+    # 4b. Moderate the generated image itself (not just its text description)
+    if mod_status == "approved":
+        image_is_safe = await is_generated_image_safe(
+            img_url, active_dice.setting, story_dict["title"], is_snapplus=(experience_mode == "snapplus")
+        )
+        if not image_is_safe:
+            mod_status = "flagged"
 
     # 5. Persist Story
     story = Story(
@@ -119,6 +128,14 @@ async def mutate_story_branch(
         mode=parent_story.experience_mode
     )
 
+    # 3b. Moderate the generated image itself
+    mutation_mod_status = "approved"
+    image_is_safe = await is_generated_image_safe(
+        img_url, mutation_type, mutated_dict["title"], is_snapplus=(parent_story.experience_mode == "snapplus")
+    )
+    if not image_is_safe:
+        mutation_mod_status = "flagged"
+
     child_story = Story(
         user_id=user_id,
         character_id=character.id,
@@ -131,7 +148,7 @@ async def mutate_story_branch(
         dice_roll={"mutation": mutation_type},
         generated_image_url=img_url,
         privacy="private",
-        moderation_status="approved"
+        moderation_status=mutation_mod_status
     )
     db.add(child_story)
     await db.commit()

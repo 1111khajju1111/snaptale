@@ -26,3 +26,13 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
+dev_dependencies:
+  flutter_launcher_icons: ^0.14.4
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/snaptale_icon.png"
+  adaptive_icon_background: "#FFD400"
+  adaptive_icon_foreground: "assets/icon/snaptale_icon_foreground.png"

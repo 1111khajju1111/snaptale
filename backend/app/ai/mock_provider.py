@@ -296,3 +296,10 @@ class MockModerationProvider(BaseModerationProvider):
             if b in lower:
                 return {"is_safe": False, "reason": "Severe policy violation detected", "action": "block"}
         return {"is_safe": True, "reason": "Content passed safety review", "action": "allow"}
+
+    async def check_image_safety(self, image_bytes: bytes, is_snapplus: bool = False) -> Dict[str, Any]:
+        # Dev/test-only stub. Never used when AI_PROVIDER=gemini; real image bytes
+        # are never actually inspected here, so this must not run in production.
+        if b"UNSAFE_TEST_IMAGE" in image_bytes:
+            return {"is_safe": False, "reason": "Severe policy violation detected in test image", "action": "block"}
+        return {"is_safe": True, "reason": "Mock image safety check passed", "action": "allow"}

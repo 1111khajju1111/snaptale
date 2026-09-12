@@ -69,6 +69,21 @@ class Settings(BaseSettings):
                     "FATAL CONFIG ERROR: Production deployment cannot use wildcard CORS (*)."
                 )
 
+            # AI provider gate: production must never silently run on mock vision,
+            # story, image, or moderation providers (e.g. filename-based "human
+            # detection", fixed placeholder images, or a blocklist moderator).
+            provider_type = self.AI_PROVIDER.lower()
+            if provider_type == "mock":
+                raise RuntimeError(
+                    "FATAL CONFIG ERROR: Production deployment cannot run with AI_PROVIDER=mock. "
+                    "Set AI_PROVIDER=gemini with a valid GEMINI_API_KEY."
+                )
+            if provider_type == "gemini" and not (self.GEMINI_API_KEY or self.AI_PROVIDER_API_KEY):
+                raise RuntimeError(
+                    "FATAL CONFIG ERROR: Production deployment has AI_PROVIDER=gemini but no "
+                    "GEMINI_API_KEY/AI_PROVIDER_API_KEY configured. Refusing to start on mock fallback."
+                )
+
     class Config:
         env_file = ".env"
         extra = "ignore"
