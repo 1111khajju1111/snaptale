@@ -24,10 +24,14 @@ class Settings(BaseSettings):
     STORAGE_BUCKET: str = "snaptale-media"
     
     # AI Engine
-    AI_PROVIDER: str = "mock"  # "mock", "gemini", or "openai"
+    AI_PROVIDER: str = "mock"  # "mock", "huggingface", "gemini"
     AI_PROVIDER_API_KEY: str = ""
+    HF_TOKEN: str = ""
+    HF_PROVIDER: str = "auto"
+    HF_TEXT_MODEL: str = "openai/gpt-oss-20b"
+    HF_VISION_MODEL: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    HF_IMAGE_MODEL: str = "black-forest-labs/FLUX.1-schnell"
     GEMINI_API_KEY: str = ""
-    OPENAI_API_KEY: str = ""
     
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -76,7 +80,12 @@ class Settings(BaseSettings):
             if provider_type == "mock":
                 raise RuntimeError(
                     "FATAL CONFIG ERROR: Production deployment cannot run with AI_PROVIDER=mock. "
-                    "Set AI_PROVIDER=gemini with a valid GEMINI_API_KEY."
+                    "Set AI_PROVIDER=huggingface with a valid HF_TOKEN (or configure another real provider)."
+                )
+            if provider_type == "huggingface" and not (self.HF_TOKEN or self.AI_PROVIDER_API_KEY):
+                raise RuntimeError(
+                    "FATAL CONFIG ERROR: Production deployment has AI_PROVIDER=huggingface but no "
+                    "HF_TOKEN/AI_PROVIDER_API_KEY configured."
                 )
             if provider_type == "gemini" and not (self.GEMINI_API_KEY or self.AI_PROVIDER_API_KEY):
                 raise RuntimeError(

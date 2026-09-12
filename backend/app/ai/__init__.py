@@ -8,26 +8,24 @@ from app.ai.mock_provider import (
 from app.ai.gemini_provider import (
     GeminiVisionProvider, GeminiStoryProvider, GeminiImageProvider, GeminiModerationProvider
 )
+from app.ai.hf_provider import (
+    HFVisionProvider, HFStoryProvider, HFImageProvider, HFModerationProvider
+)
 
 def get_ai_providers():
     provider_type = settings.AI_PROVIDER.lower()
-    api_key = settings.GEMINI_API_KEY or settings.AI_PROVIDER_API_KEY
+    api_key = (settings.HF_TOKEN or settings.AI_PROVIDER_API_KEY) if provider_type == "huggingface" else (settings.GEMINI_API_KEY or settings.AI_PROVIDER_API_KEY)
 
+    if provider_type == "huggingface" and api_key:
+        return (
+            HFVisionProvider(api_key), HFStoryProvider(api_key),
+            HFImageProvider(api_key), HFModerationProvider(api_key)
+        )
     if provider_type == "gemini" and api_key:
-        # Real provider mode: every AI capability is backed by Gemini.
-        # None of these fall back to mock output on failure — they fail closed instead.
-        vision_provider = GeminiVisionProvider(api_key=api_key)
-        story_provider = GeminiStoryProvider(api_key=api_key)
-        image_provider = GeminiImageProvider(api_key=api_key)
-        moderation_provider = GeminiModerationProvider(api_key=api_key)
-    else:
-        # Mock mode: development/testing only. Enforced not to run in production
-        # by Settings.validate_production_security() at startup.
-        vision_provider = MockVisionProvider()
-        story_provider = MockStoryProvider()
-        image_provider = MockImageProvider()
-        moderation_provider = MockModerationProvider()
-
-    return vision_provider, story_provider, image_provider, moderation_provider
+        return (
+            GeminiVisionProvider(api_key), GeminiStoryProvider(api_key),
+            GeminiImageProvider(api_key), GeminiModerationProvider(api_key)
+        )
+    return (MockVisionProvider(), MockStoryProvider(), MockImageProvider(), MockModerationProvider())
 
 vision_provider, story_provider, image_provider, moderation_provider = get_ai_providers()

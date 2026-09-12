@@ -47,11 +47,11 @@ async def is_generated_image_safe(
             logger.error(f"Image safety check failed unexpectedly: {e}")
             return False
 
-    if settings.AI_PROVIDER.lower() == "gemini":
+    if settings.AI_PROVIDER.lower() in ("gemini", "huggingface"):
         # Real provider mode with no inspectable image bytes is an unexpected
         # state (GeminiImageProvider always returns a data: URI on success) -
         # fail closed instead of silently degrading to text-only moderation.
-        logger.error("No inspectable image bytes available under AI_PROVIDER=gemini; failing closed.")
+        logger.error("No inspectable image bytes available under a real AI provider; failing closed.")
         return False
 
     # Dev/test mock mode only.
