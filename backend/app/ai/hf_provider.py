@@ -42,18 +42,17 @@ IMAGE_MODEL_NAME = os.getenv(
 )
 
 
-# Providers are separated by capability.
+# Providers are configured independently by capability.
 #
 # Vision:
-#   Featherless AI is currently selected because the SnapTale VLM
-#   Qwen/Qwen2.5-VL-3B-Instruct is currently routed there on Hugging Face.
+#   Featherless AI is selected because the Qwen VLM is available there.
 #
 # Text:
-#   auto lets Hugging Face select a compatible provider.
+#   auto allows Hugging Face to select a compatible provider.
 #
 # Image:
-#   auto lets Hugging Face select a compatible provider.
-#
+#   auto allows Hugging Face to select a compatible provider.
+
 VISION_PROVIDER = os.getenv(
     "HF_VISION_PROVIDER",
     "featherless-ai",
@@ -70,7 +69,10 @@ IMAGE_PROVIDER = os.getenv(
 )
 
 
-# Retry configuration.
+# ============================================================================
+# RETRY CONFIGURATION
+# ============================================================================
+
 RETRY_DELAYS = (
     1.0,
     2.0,
@@ -90,6 +92,7 @@ def _unavailable(detail: str) -> HTTPException:
 
     Human detection and moderation intentionally fail closed.
     """
+
     return HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail=detail,
@@ -101,15 +104,13 @@ def _init_client(
     provider: str = "auto",
 ):
     """
-    Initialize a Hugging Face InferenceClient.
+    Initialize Hugging Face InferenceClient.
 
     Provider is capability-specific:
-        Vision  -> featherless-ai
-        Text    -> auto
-        Image   -> auto
 
-    Hugging Face routes the request through its infrastructure when
-    using an HF token.
+        Vision -> featherless-ai
+        Text   -> auto
+        Image  -> auto
     """
 
     if not api_key:
@@ -127,20 +128,27 @@ def _init_client(
         )
 
         logger.info(
-            "Initialized Hugging Face client with provider=%s",
+            "Initialized Hugging Face client "
+            "with provider=%s",
             provider,
         )
 
         return client
 
     except Exception as exc:
+
         logger.error(
             "Failed to initialize Hugging Face client: %s",
             exc,
             exc_info=True,
         )
+
         return None
 
+
+# ============================================================================
+# JSON PARSER
+# ============================================================================
 
 def _parse_json_response(
     text: str,
@@ -148,10 +156,11 @@ def _parse_json_response(
     """
     Parse JSON from an AI response.
 
-    Handles:
-    - Plain JSON
-    - ```json fenced blocks
-    - JSON embedded in a small amount of prose
+    Supports:
+
+    1. Plain JSON
+    2. ```json fenced blocks
+    3. JSON embedded inside small amounts of prose
     """
 
     if not text:
@@ -161,8 +170,12 @@ def _parse_json_response(
 
     cleaned = text.strip()
 
-    # Remove Markdown code fences.
+    # ------------------------------------------------------------------------
+    # Remove Markdown code fences
+    # ------------------------------------------------------------------------
+
     if cleaned.startswith("```"):
+
         lines = cleaned.splitlines()
 
         if lines and lines[0].strip().lower() in (
@@ -176,30 +189,69 @@ def _parse_json_response(
 
         cleaned = "\n".join(lines).strip()
 
-    # First attempt: pure JSON.
+    # ------------------------------------------------------------------------
+    # First attempt: direct JSON
+    # ------------------------------------------------------------------------
+
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+
+        if isinstance(parsed, dict):
+            return parsed
 
     except json.JSONDecodeError:
         pass
 
-    # Second attempt: locate the outer JSON object.
+    # ------------------------------------------------------------------------
+    # Second attempt: locate outer JSON object
+    # ------------------------------------------------------------------------
+
     start = cleaned.find("{")
     end = cleaned.rfind("}")
 
     if start >= 0 and end > start:
-        return json.loads(
-            cleaned[start : end + 1]
-        )
+
+        candidate = cleaned[
+            start : end + 1
+        ]
+
+        try:
+
+            parsed = json.loads(candidate)
+
+            if isinstance(parsed, dict):
+                return parsed
+
+        except json.JSONDecodeError:
+            pass
 
     raise ValueError(
         "Model response did not contain valid JSON."
     )
 
 
+# ============================================================================
+# RESPONSE TEXT EXTRACTION
+# ============================================================================
+
 def _message_text(result) -> str:
     """
-    Extract text from a Hugging Face ChatCompletion response.
+    Extract generated text from Hugging Face
+    OpenAI-compatible ChatCompletion responses.
+
+    Supports:
+
+    - normal message.content
+    - list-based content
+    - structured content blocks
+    - reasoning_content
+    - reasoning
+    - output_text
+    - choice.text
+
+    This is intentionally defensive because different
+    Hugging Face inference providers can expose slightly
+    different response structures.
     """
 
     if not result:
@@ -207,12 +259,18 @@ def _message_text(result) -> str:
             "Model returned an empty response."
         )
 
-    if not getattr(result, "choices", None):
+    choices = getattr(
+        result,
+        "choices",
+        None,
+    )
+
+    if not choices:
         raise ValueError(
             "Model returned no choices."
         )
 
-    choice = result.choices[0]
+    choice = choices[0]
 
     message = getattr(
         choice,
@@ -220,36 +278,139 @@ def _message_text(result) -> str:
         None,
     )
 
-    if not message:
-        raise ValueError(
-            "Model returned no message."
+    # ------------------------------------------------------------------------
+    # Standard OpenAI-compatible response
+    # ------------------------------------------------------------------------
+
+    if message is not None:
+
+        content = getattr(
+            message,
+            "content",
+            None,
         )
 
-    content = getattr(
-        message,
-        "content",
-        None,
+        # Normal string content
+        if isinstance(content, str):
+
+            if content.strip():
+                return content.strip()
+
+        # Structured/list content
+        if isinstance(content, list):
+
+            parts = []
+
+            for item in content:
+
+                if isinstance(item, dict):
+
+                    text = item.get(
+                        "text"
+                    )
+
+                    if text:
+                        parts.append(
+                            str(text)
+                        )
+
+                else:
+
+                    text = getattr(
+                        item,
+                        "text",
+                        None,
+                    )
+
+                    if text:
+                        parts.append(
+                            str(text)
+                        )
+
+            combined = "".join(parts).strip()
+
+            if combined:
+                return combined
+
+        # --------------------------------------------------------------------
+        # Reasoning-capable models/providers
+        # --------------------------------------------------------------------
+
+        for attribute in (
+            "reasoning_content",
+            "reasoning",
+            "output_text",
+            "text",
+        ):
+
+            value = getattr(
+                message,
+                attribute,
+                None,
+            )
+
+            if isinstance(value, str):
+
+                if value.strip():
+                    return value.strip()
+
+    # ------------------------------------------------------------------------
+    # Some providers may put generated text directly on choice
+    # ------------------------------------------------------------------------
+
+    for attribute in (
+        "text",
+        "output_text",
+    ):
+
+        value = getattr(
+            choice,
+            attribute,
+            None,
+        )
+
+        if isinstance(value, str):
+
+            if value.strip():
+                return value.strip()
+
+    # ------------------------------------------------------------------------
+    # Diagnostic information
+    # ------------------------------------------------------------------------
+
+    message_attributes = []
+
+    if message is not None:
+
+        message_attributes = [
+            attribute
+            for attribute in dir(message)
+            if not attribute.startswith("_")
+        ]
+
+    logger.error(
+        "Hugging Face returned a response "
+        "without usable text. "
+        "result_type=%s "
+        "choice_type=%s "
+        "message_type=%s "
+        "message_attributes=%s",
+        type(result).__name__,
+        type(choice).__name__,
+        type(message).__name__
+        if message is not None
+        else "None",
+        message_attributes,
     )
 
-    # Some providers may return content in a slightly different form.
-    if isinstance(content, list):
-        parts = []
+    raise ValueError(
+        "Model returned no text content."
+    )
 
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if text:
-                    parts.append(str(text))
 
-        content = "".join(parts)
-
-    if not content:
-        raise ValueError(
-            "Model returned no text content."
-        )
-
-    return str(content)
-
+# ============================================================================
+# ERROR CLASSIFICATION
+# ============================================================================
 
 def _is_retryable(
     exc: Exception,
@@ -274,6 +435,8 @@ def _is_retryable(
         "TOO MANY REQUESTS",
         "SERVER ERROR",
         "GATEWAY",
+        "CONNECTION RESET",
+        "CONNECTION ERROR",
     )
 
     return any(
@@ -281,6 +444,10 @@ def _is_retryable(
         for marker in retryable_markers
     )
 
+
+# ============================================================================
+# HUGGING FACE CHAT
+# ============================================================================
 
 async def _hf_chat(
     client,
@@ -290,16 +457,20 @@ async def _hf_chat(
     max_tokens: int = 1800,
     temperature: float = 0.8,
     image_data_uri: Optional[str] = None,
+    json_mode: bool = False,
 ) -> str:
     """
     Execute a Hugging Face chat-completion request.
 
-    Supports both:
-    - Text-only prompts
-    - Image + text VLM prompts
+    Supports:
+
+    - text-only prompts
+    - image + text VLM prompts
+    - optional JSON response mode
     """
 
     if image_data_uri:
+
         content = [
             {
                 "type": "text",
@@ -314,6 +485,7 @@ async def _hf_chat(
         ]
 
     else:
+
         content = prompt
 
     messages = [
@@ -323,36 +495,70 @@ async def _hf_chat(
         }
     ]
 
+    request_kwargs = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+    # ------------------------------------------------------------------------
+    # JSON response mode
+    #
+    # Only enable when explicitly requested.
+    #
+    # Vision providers are left without JSON mode because provider
+    # compatibility varies for multimodal requests.
+    # ------------------------------------------------------------------------
+
+    if json_mode:
+
+        request_kwargs["response_format"] = {
+            "type": "json_object"
+        }
+
     last_exception = None
 
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(
+        MAX_RETRIES
+    ):
 
         try:
+
             result = await asyncio.to_thread(
                 client.chat.completions.create,
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
+                **request_kwargs,
             )
 
-            return _message_text(result)
+            return _message_text(
+                result
+            )
 
         except Exception as exc:
 
             last_exception = exc
 
+            retryable = _is_retryable(
+                exc
+            )
+
             logger.warning(
                 "Hugging Face request failed "
-                "(attempt %s/%s): %s",
+                "(attempt %s/%s, retryable=%s): %s",
                 attempt + 1,
                 MAX_RETRIES,
+                retryable,
                 exc,
             )
 
+            # ----------------------------------------------------------------
+            # Do not retry deterministic response-format problems.
+            # ----------------------------------------------------------------
+
             if (
-                not _is_retryable(exc)
-                or attempt == MAX_RETRIES - 1
+                not retryable
+                or attempt
+                == MAX_RETRIES - 1
             ):
                 break
 
@@ -360,14 +566,24 @@ async def _hf_chat(
                 RETRY_DELAYS[attempt]
             )
 
-    raise last_exception
+    if last_exception is not None:
+        raise last_exception
 
+    raise ValueError(
+        "Hugging Face request failed "
+        "without a specific exception."
+    )
+
+
+# ============================================================================
+# IMAGE DATA URI
+# ============================================================================
 
 def _data_uri(
     image_bytes: bytes,
 ) -> str:
     """
-    Convert image bytes into a base64 data URI.
+    Convert image bytes into a JPEG base64 data URI.
     """
 
     encoded = base64.b64encode(
@@ -392,6 +608,7 @@ class HFVisionProvider(
         self,
         api_key: str,
     ):
+
         self.client = _init_client(
             api_key,
             provider=VISION_PROVIDER,
@@ -411,12 +628,14 @@ class HFVisionProvider(
     ) -> dict:
 
         if not self.client:
+
             raise _unavailable(
                 "Vision service is unavailable. "
                 "Photo cannot be safely verified."
             )
 
         if not image_bytes:
+
             raise _unavailable(
                 "No image data was provided."
             )
@@ -432,6 +651,7 @@ class HFVisionProvider(
                 image_data_uri=_data_uri(
                     image_bytes
                 ),
+                json_mode=False,
             )
 
             return _parse_json_response(
@@ -449,12 +669,16 @@ class HFVisionProvider(
                 exc_info=True,
             )
 
-            # IMPORTANT:
             # Human detection must fail closed.
+
             raise _unavailable(
                 "Vision service is temporarily "
                 "unavailable. Please try again."
             )
+
+    # ------------------------------------------------------------------------
+    # HUMAN DETECTION
+    # ------------------------------------------------------------------------
 
     async def detect_human(
         self,
@@ -484,6 +708,7 @@ Return true if ANY of the following is visible anywhere:
 Return false ONLY when no human is visible.
 
 Do not infer:
+
 - identity
 - age
 - gender
@@ -546,6 +771,10 @@ If a human is visible, return:
 
         return result
 
+    # ------------------------------------------------------------------------
+    # NON-HUMAN VISION ANALYSIS
+    # ------------------------------------------------------------------------
+
     async def analyze_non_human(
         self,
         image_bytes: bytes,
@@ -589,12 +818,14 @@ Return ONLY JSON:
         )
 
         # Defense-in-depth safety check.
+
         if bool(
             data.get(
                 "is_human_present",
                 False,
             )
         ):
+
             raise _unavailable(
                 "Human presence could not be "
                 "safely ruled out."
@@ -655,6 +886,7 @@ class HFStoryProvider(
     ) -> dict:
 
         if not self.client:
+
             raise _unavailable(
                 "Hugging Face text generation "
                 "service is unavailable."
@@ -668,6 +900,7 @@ class HFStoryProvider(
                 prompt,
                 max_tokens=2200,
                 temperature=0.85,
+                json_mode=True,
             )
 
             return _parse_json_response(
@@ -844,6 +1077,13 @@ Return ONLY JSON adhering to CharacterDNA.
             "CONFLICT -> TWIST -> CLIMAX -> ENDING"
         )
 
+        custom_direction = (
+            f"Additional custom direction: "
+            f"{custom_prompt}"
+            if custom_prompt
+            else ""
+        )
+
         prompt = f"""
 You are the master entertainment writer
 for SnapTale.
@@ -898,11 +1138,7 @@ Make dialogue sound like friends actually talking.
 
 Do not imitate any real actor or comedian.
 
-{
-    f"Additional custom direction: {custom_prompt}"
-    if custom_prompt
-    else ""
-}
+{custom_direction}
 
 Follow this narrative structure:
 
@@ -923,7 +1159,7 @@ punchline
 reaction
 whistle moment
 
-Return ONLY JSON:
+Return ONLY this JSON object:
 
 {{
   "title": "Story Title",
@@ -950,6 +1186,13 @@ Return ONLY JSON:
         custom_instruction: Optional[str] = None,
     ) -> Dict[str, str]:
 
+        custom_direction = (
+            f"Custom instruction: "
+            f"{custom_instruction}"
+            if custom_instruction
+            else ""
+        )
+
         prompt = f"""
 You are branching an existing SnapTale
 story into an alternate version.
@@ -974,11 +1217,7 @@ Original story:
 Mutation type:
 {mutation_type}
 
-{
-    f"Custom instruction: {custom_instruction}"
-    if custom_instruction
-    else ""
-}
+{custom_direction}
 
 Mode:
 {mode}
@@ -997,7 +1236,7 @@ Telugu-English when appropriate.
 Do not imitate real actors
 or comedians.
 
-Return ONLY JSON:
+Return ONLY this JSON object:
 
 {{
   "title": "New branch title",
@@ -1058,7 +1297,7 @@ Keep the character recognizable.
 Use natural conversational
 Telugu-English when appropriate.
 
-Return ONLY JSON:
+Return ONLY this JSON object:
 
 {{
   "title": "What If: ...",
@@ -1088,7 +1327,8 @@ Return ONLY JSON:
             f"Requested direction: {direction}"
             if direction
             else
-            "Continue the natural next beat of the story."
+            "Continue the natural next beat "
+            "of the story."
         )
 
         prompt = f"""
@@ -1125,7 +1365,7 @@ Maintain character continuity.
 Use natural conversational
 Telugu-English when appropriate.
 
-Return ONLY JSON:
+Return ONLY this JSON object:
 
 {{
   "title": "Next chapter title",
@@ -1152,6 +1392,7 @@ Return ONLY JSON:
     ) -> str:
 
         if not self.client:
+
             raise _unavailable(
                 "Chat service is unavailable."
             )
@@ -1162,6 +1403,22 @@ Return ONLY JSON:
             for turn in (
                 chat_history or []
             )
+        )
+
+        universe_text = (
+            f"Universe context: "
+            f"{universe_context}"
+            if universe_context
+            else ""
+        )
+
+        content_mode = (
+            "SnapTale+ "
+            "(edgier, dark comedy allowed)"
+            if is_snapplus
+            else
+            "SnapTale "
+            "(general audience)"
         )
 
         prompt = f"""
@@ -1192,19 +1449,10 @@ established voice.
 Do not imitate a real actor,
 comedian or celebrity.
 
-{
-    f"Universe context: {universe_context}"
-    if universe_context
-    else ""
-}
+{universe_text}
 
 Content mode:
-{
-    "SnapTale+ (edgier, dark comedy allowed)"
-    if is_snapplus
-    else
-    "SnapTale (general audience)"
-}
+{content_mode}
 
 Conversation so far:
 
@@ -1230,6 +1478,7 @@ No quotation marks around the whole reply.
                 prompt,
                 max_tokens=500,
                 temperature=0.9,
+                json_mode=False,
             )
 
             return response.strip()
@@ -1286,6 +1535,7 @@ class HFImageProvider(
     ) -> str:
 
         if not self.client:
+
             raise _unavailable(
                 "Image generation service "
                 "is unavailable."
@@ -1360,6 +1610,12 @@ Requirements:
                 model=IMAGE_MODEL_NAME,
             )
 
+            if image is None:
+
+                raise ValueError(
+                    "Image provider returned no image."
+                )
+
             buffer = BytesIO()
 
             image.save(
@@ -1375,6 +1631,9 @@ Requirements:
                 "data:image/png;base64,"
                 + encoded
             )
+
+        except HTTPException:
+            raise
 
         except Exception as exc:
 
@@ -1404,18 +1663,31 @@ class HFModerationProvider(
         api_key: str,
     ):
 
-        # Vision moderation uses the same VLM provider
-        # as human detection.
-        self.client = _init_client(
+        # --------------------------------------------------------------------
+        # IMPORTANT:
+        #
+        # Text moderation uses the TEXT provider.
+        # Image moderation uses the VISION provider.
+        #
+        # We therefore maintain two clients.
+        # --------------------------------------------------------------------
+
+        self.text_client = _init_client(
+            api_key,
+            provider=TEXT_PROVIDER,
+        )
+
+        self.vision_client = _init_client(
             api_key,
             provider=VISION_PROVIDER,
         )
 
         logger.info(
             "HFModerationProvider initialized "
-            "vision_provider=%s text_model=%s",
+            "text_provider=%s "
+            "vision_provider=%s",
+            TEXT_PROVIDER,
             VISION_PROVIDER,
-            TEXT_MODEL_NAME,
         )
 
     # ------------------------------------------------------------------------
@@ -1428,7 +1700,8 @@ class HFModerationProvider(
         is_snapplus: bool = False,
     ) -> Dict[str, Any]:
 
-        if not self.client:
+        if not self.text_client:
+
             return {
                 "is_safe": False,
                 "reason": (
@@ -1479,7 +1752,7 @@ Review:
 
 {text!r}
 
-Return ONLY JSON:
+Return ONLY this JSON:
 
 {{
   "is_safe": true,
@@ -1490,11 +1763,12 @@ Return ONLY JSON:
         try:
 
             result = await _hf_chat(
-                self.client,
+                self.text_client,
                 TEXT_MODEL_NAME,
                 prompt,
                 max_tokens=300,
                 temperature=0.0,
+                json_mode=True,
             )
 
             data = _parse_json_response(
@@ -1530,6 +1804,7 @@ Return ONLY JSON:
             )
 
             # Fail closed.
+
             return {
                 "is_safe": False,
                 "reason": (
@@ -1549,7 +1824,8 @@ Return ONLY JSON:
         is_snapplus: bool = False,
     ) -> Dict[str, Any]:
 
-        if not self.client:
+        if not self.vision_client:
+
             return {
                 "is_safe": False,
                 "reason": (
@@ -1559,6 +1835,7 @@ Return ONLY JSON:
             }
 
         if not image_bytes:
+
             return {
                 "is_safe": False,
                 "reason": (
@@ -1595,7 +1872,7 @@ Return ONLY JSON:
         try:
 
             result = await _hf_chat(
-                self.client,
+                self.vision_client,
                 VISION_MODEL_NAME,
                 prompt,
                 max_tokens=250,
@@ -1603,6 +1880,7 @@ Return ONLY JSON:
                 image_data_uri=_data_uri(
                     image_bytes
                 ),
+                json_mode=False,
             )
 
             data = _parse_json_response(
@@ -1639,6 +1917,7 @@ Return ONLY JSON:
             )
 
             # Fail closed.
+
             return {
                 "is_safe": False,
                 "reason": (
